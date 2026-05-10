@@ -17,6 +17,8 @@ func (p *Plugin) initRouter() *mux.Router {
 	apiRouter := router.PathPrefix("/api/v1").Subrouter()
 
 	apiRouter.HandleFunc("/hello", p.HelloWorld).Methods(http.MethodGet)
+	apiRouter.HandleFunc("/read-receipts/mark", p.handleMarkReadReceipts).Methods(http.MethodPost)
+	apiRouter.HandleFunc("/read-receipts", p.handleGetReadReceipts).Methods(http.MethodGet)
 
 	return router
 }
