@@ -7,6 +7,8 @@
 
 When someone eligible scrolls a message into view (above a visibility threshold), the plugin records a read receipt. **Authors** see a compact **“Read: user1, user2, …”** line under their own posts when at least one receipt exists.
 
+<img width="1400" height="664" alt="image" src="https://github.com/user-attachments/assets/25be51d2-76a4-4efb-b713-fa01da4f2d2e" />
+
 ---
 
 ## Table of contents
