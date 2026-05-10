@@ -1,135 +1,292 @@
-# Plugin Starter Template
+# Mention Read Receipts
 
 [![Build Status](https://github.com/mattermost/mattermost-plugin-starter-template/actions/workflows/ci.yml/badge.svg)](https://github.com/mattermost/mattermost-plugin-starter-template/actions/workflows/ci.yml)
 [![E2E Status](https://github.com/mattermost/mattermost-plugin-starter-template/actions/workflows/e2e.yml/badge.svg)](https://github.com/mattermost/mattermost-plugin-starter-template/actions/workflows/e2e.yml)
 
-This plugin serves as a starting point for writing a Mattermost plugin. Feel free to base your own plugin off this repository.
+**Mention Read Receipts** is a Mattermost plugin that shows **who has read posts you authored**, but only for readers who were part of the **mention audience** of that post. It works in **direct messages, group messages, and public channels**.
 
-To learn more about plugins, see [our plugin documentation](https://developers.mattermost.com/extend/plugins/).
+When someone eligible scrolls a message into view (above a visibility threshold), the plugin records a read receipt. **Authors** see a compact **“Read: user1, user2, …”** line under their own posts when at least one receipt exists.
 
-This template requires node v16 and npm v8. You can download and install nvm to manage your node versions by following the instructions [here](https://github.com/nvm-sh/nvm). Once you've setup the project simply run `nvm i` within the root folder to use the suggested version of node.
+---
 
-## Getting Started
-Use GitHub's template feature to make a copy of this repository by clicking the "Use this template" button.
+## Table of contents
 
-Alternatively shallow clone the repository matching your plugin name:
+- [Mention Read Receipts](#mention-read-receipts)
+  - [Table of contents](#table-of-contents)
+  - [Features](#features)
+  - [Who can record a read receipt?](#who-can-record-a-read-receipt)
+  - [What authors see](#what-authors-see)
+  - [Privacy and access control](#privacy-and-access-control)
+  - [Technical behavior and limitations](#technical-behavior-and-limitations)
+  - [Requirements](#requirements)
+    - [Mattermost Server](#mattermost-server)
+    - [Toolchain (build from source)](#toolchain-build-from-source)
+  - [Installation](#installation)
+  - [Architecture overview](#architecture-overview)
+    - [Server](#server)
+    - [Web application](#web-application)
+  - [HTTP API](#http-api)
+    - [`POST /read-receipts/mark`](#post-read-receiptsmark)
+    - [`GET /read-receipts`](#get-read-receipts)
+  - [WebSocket events](#websocket-events)
+  - [Development](#development)
+    - [Prerequisites](#prerequisites)
+    - [Sync generated manifest files](#sync-generated-manifest-files)
+    - [Enable plugin uploads (local / dev)](#enable-plugin-uploads-local--dev)
+    - [Deploy with local mode (`make deploy`)](#deploy-with-local-mode-make-deploy)
+    - [Watch mode (webapp + redeploy)](#watch-mode-webapp--redeploy)
+    - [Deploy with username/password or token](#deploy-with-usernamepassword-or-token)
+    - [Debug webapp bundle](#debug-webapp-bundle)
+  - [Building and versioning](#building-and-versioning)
+  - [Releasing](#releasing)
+  - [Forking this repository](#forking-this-repository)
+  - [License](#license)
+  - [Further reading](#further-reading)
+
+---
+
+## Features
+
+- **Author-only summary**: Only the **sender** of a post sees read receipts for that post (others do not see the list via the plugin UI).
+- **Mention-scoped eligibility**: Read receipts are recorded **only** when the viewer is in the **mention audience** (see below). If a post has **no** qualifying mentions, **no** receipts are stored when people read it.
+- **Broadcast mentions**: `@channel`, `@all`, and `@here` are treated as targeting **everyone in the channel**, so any channel member may generate a receipt when reading.
+- **Explicit mentions**: User IDs from `post.props["mentions"]` (plus `@username` parsing in the message text, resolved via the server API) align server-side enforcement with what clients send.
+- **Real-time updates**: After a receipt is stored, the server broadcasts a **custom WebSocket event** so clients can refresh the summary without waiting for the next poll.
+- **REST API**: Authenticated plugin routes for **batch mark** and **batch fetch** with sensible limits (see [HTTP API](#http-api)).
+- **Conflict-safe storage**: Receipt merges use optimistic concurrency with retries on the plugin KV store.
+
+---
+
+## Who can record a read receipt?
+
+A user **U** may record a receipt for post **P** when **all** of the following hold:
+
+1. **U** is logged in and passes plugin HTTP auth (`Mattermost-User-ID`).
+2. **P** exists and is **not deleted**.
+3. **U** is **not** the author of **P** (authors never record receipts on their own posts).
+4. **U** is a **member of the channel** containing **P**.
+5. **U** is in the **mention audience** of **P**, defined as **any** of:
+   - The message contains **`@channel`**, **`@all`**, or **`@here`** (case-insensitive, word boundary).
+   - **U**’s user ID appears in `post.props["mentions"]` (supports JSON array, Go string slice, mixed-type slices, or a JSON string encoding an ID array—matching common Mattermost post shapes).
+   - **U**’s username matches an **`@username`** token in the message where `username` is resolved via `GetUserByUsername` (broadcast keywords are skipped).
+
+If none of these apply, the server **rejects** storing a receipt for **U** (logged at debug level).
+
+---
+
+## What authors see
+
+- Under **your own** posts, if there is at least one stored reader (excluding yourself), the webapp shows **`Read: …`** with usernames.
+- **Recipients** who open the channel still render a minimal anchor component so visibility detection can run where needed; they do **not** see the receipt list for posts they did not author.
+
+---
+
+## Privacy and access control
+
+- **GET read receipts** returns data **only for posts whose `user_id` matches the requesting user** and where that user is still a channel member. You cannot use the API to read receipts on someone else’s posts.
+- Receipt payloads include **reader user IDs** and **millisecond timestamps** (`read_at`) as stored server-side.
+
+---
+
+## Technical behavior and limitations
+
+- **Plugin KV namespace**: Receipt documents live under keys prefixed with `readrec_v1_` plus the post ID. KV is **scoped per plugin ID**; changing `plugin.json` → `id` creates a **new** plugin identity on the server, so **existing receipts are not migrated automatically**.
+- **Mark vs. display rules**: **Recording** a receipt enforces the mention audience using the **current post** fetched at mark time. **Listing** receipts for your posts does **not** re-filter historical readers if the message is later edited and mentions change—already stored readers remain visible (by design for simplicity).
+- **Batch limits**: Up to **80** post IDs per mark or get request (constant `maxReadReceiptPostIDs` on the server).
+- **Webhooks / bots**: Behavior follows the same mention rules on the **stored post** at mark time; special cases are not implemented beyond normal post metadata.
+- **Boilerplate**: This codebase still includes the starter **slash command** (`/hello`) and sample **`/api/v1/hello`** handler; remove them in a production fork if unwanted.
+
+---
+
+## Requirements
+
+The versions below are what this repository declares and is developed against. Pinning them avoids “works on my machine” drift between contributors and CI.
+
+### Mattermost Server
+
+| | Version |
+|---|--------|
+| **Minimum** (manifest) | **6.2.1** — set in [`plugin.json`](plugin.json) as `min_server_version`. The server will refuse or warn on older Mattermost builds depending on policy. |
+| **Recommended / tested** | **Mattermost 11.6.x** — primary manual testing target. The webapp depends on **`@mattermost/types`** and **`mattermost-redux` `11.1.0`** ([`webapp/package.json`](webapp/package.json)); use a **Mattermost 11.x** server for the closest match to those APIs and Redux shapes. |
+
+Server-side plugin API comes from **`github.com/mattermost/mattermost/server/public`** ([`go.mod`](go.mod)), currently **`v0.1.21`**. Newer Mattermost releases often ship with compatible server bundles; if you upgrade the server, bump this module to the version documented for that Mattermost release if builds fail.
+
+### Toolchain (build from source)
+
+| Tool | Version | Where it is defined |
+|------|---------|---------------------|
+| **Go** | **1.25.0** | [`go.mod`](go.mod) (`go 1.25.0`) |
+| **Node.js** | **20.20.2** | [`.nvmrc`](.nvmrc) |
+
+Use [nvm](https://github.com/nvm-sh/nvm) from the repo root:
+
+```bash
+nvm install
+nvm use
 ```
-git clone --depth 1 https://github.com/mattermost/mattermost-plugin-starter-template com.example.my-plugin
+
+Then install webapp dependencies (see [Development](#development)).
+
+**npm**: Use a current npm release bundled with Node 24 (e.g. run `npm -v` after `nvm use`; lockfile is [`webapp/package-lock.json`](webapp/package-lock.json)).
+
+---
+
+## Installation
+
+1. Build the plugin bundle (see [Building and versioning](#building-and-versioning)).
+2. Upload **`dist/<plugin-id>-<version>.tar.gz`** via **System Console → Plugins → Upload Plugin**, or use **`mmctl plugin install`** / **`make deploy`** for development servers.
+3. Enable the plugin in **System Console → Plugins**.
+
+Ensure **Plugin uploads** or your deployment path allows installing the bundle (see [Development](#development)).
+
+---
+
+## Architecture overview
+
+### Server
+
+- **`server/read_receipts.go`**: KV **get/merge** with retries, **`recordReadReceipt`**, HTTP handlers **`handleMarkReadReceipts`** / **`handleGetReadReceipts`**, **`PublishWebSocketEvent`** after a successful merge.
+- **`server/read_receipt_mentions.go`**: **`readerMayAckReadReceipt`** (mention audience checks shared with mark path).
+- **`server/api.go`**: Routes under **`/api/v1`** (plugin-relative base URL).
+
+### Web application
+
+- Registers a **`PostMessageAttachment`** component so receipts render with posts. Mattermost supplies **`postId`** for this pluggable; the component resolves **`post`** from Redux via **`getPost`** when needed.
+- **`IntersectionObserver`** triggers batched **mark** requests when the viewer is eligible (client mirrors mention rules to reduce useless API calls).
+- Subscribes to **`custom_<pluginId>_read_receipt_updated`** and updates a small in-memory store for instant UI refresh.
+
+---
+
+## HTTP API
+
+Base path (authenticated Mattermost session / CSRF as used by the webapp):
+
+```http
+https://<site-url>/plugins/mention-read-receipts/api/v1/
 ```
 
-Note that this project uses [Go modules](https://github.com/golang/go/wiki/Modules). Be sure to locate the project outside of `$GOPATH`.
+Replace **`mention-read-receipts`** if you change `plugin.json` → **`id`**.
 
-Edit the following files:
-1. `plugin.json` with your `id`, `name`, and `description`:
+### `POST /read-receipts/mark`
+
+Records read receipts for the authenticated user.
+
+**Request body (JSON):**
+
 ```json
 {
-    "id": "com.example.my-plugin",
-    "name": "My Plugin",
-    "description": "A plugin to enhance Mattermost."
+  "post_ids": ["post_id_1", "post_id_2"]
 }
 ```
 
-2. `go.mod` with your Go module path, following the `<hosting-site>/<repository>/<module>` convention:
-```
-module github.com/example/my-plugin
+**Responses:**
+
+- **`200 OK`** — `{ "status": "ok" }`. Per-post failures are skipped with debug logging (invalid post, not channel member, author self-read, not in mention audience, etc.).
+- **`400 Bad Request`** — malformed JSON or too many IDs (> 80).
+
+### `GET /read-receipts`
+
+Returns receipts **only for posts authored by the caller**.
+
+**Query:**
+
+| Parameter | Description |
+|-----------|-------------|
+| `post_ids` | Comma-separated post IDs (max 80 after deduplication). Empty → empty `receipts`. |
+
+**Response (`200 OK`):**
+
+```json
+{
+  "receipts": {
+    "post_id_1": {
+      "reader_user_id": 1712345678901
+    }
+  }
+}
 ```
 
-3. Replace all occurrences of `github.com/mattermost/mattermost-plugin-starter-template` in the codebase with your Go module path:
-```bash
-sed -i '' 's|github.com/mattermost/mattermost-plugin-starter-template|github.com/example/my-plugin|g' server/*.go
-```
+Values are **`read_at`** in **Unix milliseconds**.
 
-4. Replace `.golangci.yml` `local-prefixes` attribute with your Go module path:
-```yml
-linters-settings:
-  # [...]
-  goimports:
-    local-prefixes: github.com/example/my-plugin
-```
+---
 
-5. Build your plugin:
-```
-make
-```
+## WebSocket events
 
-This will produce a single plugin file (with support for multiple architectures) for upload to your Mattermost server:
+After a successful receipt merge, the server publishes:
 
-```
-dist/com.example.my-plugin.tar.gz
-```
+| Field | Value |
+|-------|--------|
+| Event name | `custom_<plugin_id>_read_receipt_updated` |
+| Broadcast | Same **channel** as the post |
+| Payload | `post_id`, `reader_id`, `read_at` (stringified timestamp in plugin code) |
+
+The webapp registers this event in [`webapp/src/index.tsx`](webapp/src/index.tsx) and updates [`read_receipt_store`](webapp/src/read_receipt/read_receipt_store.ts).
+
+---
 
 ## Development
 
-To avoid having to manually install your plugin, build and deploy your plugin using one of the following options. In order for the below options to work, you must first enable plugin uploads via your config.json or API and restart Mattermost.
+### Prerequisites
 
-```json
-    "PluginSettings" : {
-        ...
-        "EnableUploads" : true
-    }
+- Go toolchain matching [`go.mod`](go.mod).
+- Node matching [`.nvmrc`](.nvmrc) and npm (install webapp deps from [`webapp/package.json`](webapp/package.json)).
+
+### Sync generated manifest files
+
+After editing [`plugin.json`](plugin.json), regenerate embedded manifests:
+
+```bash
+make apply
 ```
 
-### Development guidance
+This updates **`server/manifest.go`** and **`webapp/src/manifest.ts`** (often gitignored; safe to regenerate before releases).
 
-1. Fewer packages is better: default to the main package unless there's good reason for a new package.
+### Enable plugin uploads (local / dev)
 
-2. Coupling implies same package: don't jump through hoops to break apart code that's naturally coupled.
+```json
+"PluginSettings": {
+    "EnableUploads": true
+}
+```
 
-3. New package for a new interface: a classic example is the sqlstore with layers for monitoring performance, caching and mocking.
+Restart Mattermost after changing config.
 
-4. New package for upstream integration: a discrete client package for interfacing with a 3rd party is often a great place to break out into a new package
+### Deploy with local mode (`make deploy`)
 
-### Modifying the server boilerplate
-
-The server code comes with some boilerplate for creating an api, using slash commands, accessing the kvstore and using the cluster package for jobs.
-
-#### Api
-
-api.go implements the ServeHTTP hook which allows the plugin to implement the http.Handler interface. Requests destined for the `/plugins/{id}` path will be routed to the plugin. This file also contains a sample `HelloWorld` endpoint that is tested in plugin_test.go.
-
-#### Command package
-
-This package contains the boilerplate for adding a slash command and an instance of it is created in the `OnActivate` hook in plugin.go. If you don't need it you can delete the package and remove any reference to `commandClient` in plugin.go. The package also contains an example of how to create a mock for testing.
-
-#### KVStore package
-
-This is a central place for you to access the KVStore methods that are available in the `pluginapi.Client`. The package contains an interface for you to define your methods that will wrap the KVStore methods. An instance of the KVStore is created in the `OnActivate` hook.
-
-### Deploying with Local Mode
-
-If your Mattermost server is running locally, you can enable [local mode](https://docs.mattermost.com/administration/mmctl-cli-tool.html#local-mode) to streamline deploying your plugin. Edit your server configuration as follows:
+See [Mattermost mmctl local mode](https://docs.mattermost.com/administration/mmctl-cli-tool.html#local-mode). Example server snippet:
 
 ```json
 {
     "ServiceSettings": {
-        ...
         "EnableLocalMode": true,
         "LocalModeSocketLocation": "/var/tmp/mattermost_local.socket"
-    },
+    }
 }
 ```
 
-and then deploy your plugin:
-```
+Then:
+
+```bash
 make deploy
 ```
 
-You may also customize the Unix socket path:
+Optional socket override:
+
 ```bash
 export MM_LOCALSOCKETPATH=/var/tmp/alternate_local.socket
 make deploy
 ```
 
-If developing a plugin with a webapp, watch for changes and deploy those automatically:
+### Watch mode (webapp + redeploy)
+
 ```bash
 export MM_SERVICESETTINGS_SITEURL=http://localhost:8065
-export MM_ADMIN_TOKEN=j44acwd8obn78cdcx7koid4jkr
+export MM_ADMIN_TOKEN=<your-admin-token>
 make watch
 ```
 
-### Deploying with credentials
+### Deploy with username/password or token
 
-Alternatively, you can authenticate with the server's API with credentials:
 ```bash
 export MM_SERVICESETTINGS_SITEURL=http://localhost:8065
 export MM_ADMIN_USERNAME=admin
@@ -137,87 +294,75 @@ export MM_ADMIN_PASSWORD=password
 make deploy
 ```
 
-or with a [personal access token](https://docs.mattermost.com/developer/personal-access-tokens.html):
+Or use a [personal access token](https://docs.mattermost.com/developer/personal-access-tokens.html):
+
 ```bash
 export MM_SERVICESETTINGS_SITEURL=http://localhost:8065
-export MM_ADMIN_TOKEN=j44acwd8obn78cdcx7koid4jkr
+export MM_ADMIN_TOKEN=<token>
 make deploy
 ```
 
-### Releasing new versions
+### Debug webapp bundle
 
-The version of a plugin is determined at compile time, automatically populating a `version` field in the [plugin manifest](plugin.json):
-* If the current commit matches a tag, the version will match after stripping any leading `v`, e.g. `1.3.1`.
-* Otherwise, the version will combine the nearest tag with `git rev-parse --short HEAD`, e.g. `1.3.1+d06e53e1`.
-* If there is no version tag, an empty version will be combined with the short hash, e.g. `0.0.0+76081421`.
-
-To disable this behaviour, manually populate and maintain the `version` field.
-
-## How to Release
-
-To trigger a release, follow these steps:
-
-1. **For Patch Release:** Run the following command:
-    ```
-    make patch
-    ```
-   This will release a patch change.
-
-2. **For Minor Release:** Run the following command:
-    ```
-    make minor
-    ```
-   This will release a minor change.
-
-3. **For Major Release:** Run the following command:
-    ```
-    make major
-    ```
-   This will release a major change.
-
-4. **For Patch Release Candidate (RC):** Run the following command:
-    ```
-    make patch-rc
-    ```
-   This will release a patch release candidate.
-
-5. **For Minor Release Candidate (RC):** Run the following command:
-    ```
-    make minor-rc
-    ```
-   This will release a minor release candidate.
-
-6. **For Major Release Candidate (RC):** Run the following command:
-    ```
-    make major-rc
-    ```
-   This will release a major release candidate.
-
-## Q&A
-
-### How do I make a server-only or web app-only plugin?
-
-Simply delete the `server` or `webapp` folders and remove the corresponding sections from `plugin.json`. The build scripts will skip the missing portions automatically.
-
-### How do I include assets in the plugin bundle?
-
-Place them into the `assets` directory. To use an asset at runtime, build the path to your asset and open as a regular file:
-
-```go
-bundlePath, err := p.API.GetBundlePath()
-if err != nil {
-    return errors.Wrap(err, "failed to get bundle path")
-}
-
-profileImage, err := ioutil.ReadFile(filepath.Join(bundlePath, "assets", "profile_image.png"))
-if err != nil {
-    return errors.Wrap(err, "failed to read profile image")
-}
-
-if appErr := p.API.SetProfileImage(userID, profileImage); appErr != nil {
-    return errors.Wrap(err, "failed to set profile image")
-}
+```bash
+make dist MM_DEBUG=1
 ```
 
-### How do I build the plugin with unminified JavaScript?
-Setting the `MM_DEBUG` environment variable will invoke the debug builds. The simplist way to do this is to simply include this variable in your calls to `make` (e.g. `make dist MM_DEBUG=1`).
+---
+
+## Building and versioning
+
+From the repository root:
+
+```bash
+make dist
+```
+
+Produces **`dist/<bundle-name>.tar.gz`** for upload.
+
+Version handling (unless you pin **`version`** manually in `plugin.json`):
+
+- If `HEAD` matches a Git tag: version is the tag without a leading `v` (e.g. `1.3.1`).
+- Otherwise: nearest tag plus short SHA (e.g. `1.3.1+d06e53e1`).
+- With no tags: `0.0.0+<short-sha>`.
+
+See `make apply` / `build/manifest` tooling for details.
+
+---
+
+## Releasing
+
+Semantic release helpers (tags + changelog flow depending on template Makefile):
+
+| Goal | Command |
+|------|---------|
+| Patch | `make patch` |
+| Minor | `make minor` |
+| Major | `make major` |
+| Patch RC | `make patch-rc` |
+| Minor RC | `make minor-rc` |
+| Major RC | `make major-rc` |
+
+---
+
+## Forking this repository
+
+If you publish your own fork:
+
+1. Set **`id`**, **`name`**, **`description`**, **`homepage_url`**, **`support_url`**, and **`icon_path`** in [`plugin.json`](plugin.json).
+2. Run **`make apply`** so manifests stay in sync.
+3. Update **Go module path** in [`go.mod`](go.mod) and replace imports of `github.com/mattermost/mattermost-plugin-starter-template` across **`server/**/*.go`** (and regenerate mocks / [`Makefile`](Makefile) `mockgen` paths if needed).
+4. Adjust **`.golangci.yml`** `local-prefixes` to your module path.
+5. Update **README badges** and repository URLs so CI badges point at **your** GitHub org/repo.
+
+---
+
+## License
+
+See [`LICENSE`](LICENSE). Portions may retain Mattermost starter-template copyright notices in individual files.
+
+---
+
+## Further reading
+
+- [Mattermost plugin developer documentation](https://developers.mattermost.com/extend/plugins/)

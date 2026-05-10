@@ -24,7 +24,7 @@ func (p *Plugin) initRouter() *mux.Router {
 }
 
 // ServeHTTP demonstrates a plugin that handles HTTP requests by greeting the world.
-// The root URL is currently <siteUrl>/plugins/com.mattermost.plugin-starter-template/api/v1/. Replace com.mattermost.plugin-starter-template with the plugin ID.
+// HTTP routes are served under <siteUrl>/plugins/<plugin-id>/api/v1/ (see plugin.json "id").
 func (p *Plugin) ServeHTTP(c *plugin.Context, w http.ResponseWriter, r *http.Request) {
 	p.router.ServeHTTP(w, r)
 }

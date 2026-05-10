@@ -103,6 +103,9 @@ func (p *Plugin) recordReadReceipt(readerID, postID string, readAt int64) error 
 	if _, appErr := p.API.GetChannelMember(post.ChannelId, readerID); appErr != nil {
 		return appErr
 	}
+	if !p.readerMayAckReadReceipt(readerID, post) {
+		return errors.New("reader not in mention audience")
+	}
 	if err := p.mergeReadReceiptReader(post.Id, readerID, readAt); err != nil {
 		return err
 	}

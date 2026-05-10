@@ -2,7 +2,7 @@
 // See LICENSE.txt for license information.
 
 import React, {useEffect, useLayoutEffect, useMemo, useRef, useSyncExternalStore} from 'react';
-import {useSelector} from 'react-redux';
+import {useSelector, useStore} from 'react-redux';
 
 import type {GlobalState} from '@mattermost/types/store';
 import type {Post} from '@mattermost/types/posts';
@@ -11,6 +11,7 @@ import {getCurrentUserId, getUser} from 'mattermost-redux/selectors/entities/use
 
 import {scheduleReceiptFetch} from './read_receipt_fetch_batch';
 import {enqueueMarkPostRead} from './read_receipt_mark_batch';
+import {isCurrentUserMentionReadReceiptTarget} from './read_receipt_mentions';
 import * as ReceiptStore from './read_receipt_store';
 
 import './read_receipt.css';
@@ -32,6 +33,7 @@ function usePostReceipts(postId: string): Record<string, number> {
 
 export default function PostReadReceipt(props: Props): React.ReactElement | null {
     const postId = props.post?.id ?? props.postId ?? '';
+    const store = useStore<GlobalState>();
     const postFromStore = useSelector((state: GlobalState) => (postId ? getPost(state, postId) : undefined));
     const post = props.post ?? postFromStore;
     const currentUserId = useSelector(getCurrentUserId);
@@ -77,9 +79,11 @@ export default function PostReadReceipt(props: Props): React.ReactElement | null
     }, [postId, isDeleted, isOwnPost]);
 
     useEffect(() => {
-        if (!postId || isDeleted || isOwnPost) {
+        if (!postId || isDeleted || isOwnPost || !currentUserId) {
             return undefined;
         }
+        const uid = `${currentUserId}`;
+        const pid = postId;
         const el = rootRef.current;
         if (!el) {
             return undefined;
@@ -88,7 +92,11 @@ export default function PostReadReceipt(props: Props): React.ReactElement | null
             (entries) => {
                 for (const entry of entries) {
                     if (entry.isIntersecting && entry.intersectionRatio >= 0.2) {
-                        enqueueMarkPostRead(postId);
+                        const state = store.getState();
+                        const latest: Post | undefined = getPost(state, pid);
+                        if (latest && isCurrentUserMentionReadReceiptTarget(state, latest, uid)) {
+                            enqueueMarkPostRead(pid);
+                        }
                         break;
                     }
                 }
@@ -97,7 +105,7 @@ export default function PostReadReceipt(props: Props): React.ReactElement | null
         );
         observer.observe(el);
         return () => observer.disconnect();
-    }, [postId, isDeleted, isOwnPost]);
+    }, [postId, isDeleted, isOwnPost, currentUserId, store, post]);
 
     if (!postId || isDeleted) {
         return null;

@@ -1,10 +1,10 @@
 {
-    "id": "com.mattermost.plugin-starter-template",
-    "name": "Plugin Starter Template",
-    "description": "Starter template with LINE-style read receipts on posts you send (DM, group, and public channels).",
+    "id": "mention-read-receipts",
+    "name": "Mention Read Receipts",
+    "description": "Shows who among mentioned users (@user, @channel/@all/@here) has read posts you sent—in direct messages, group messages, and public channels.",
     "homepage_url": "https://github.com/mattermost/mattermost-plugin-starter-template",
     "support_url": "https://github.com/mattermost/mattermost-plugin-starter-template/issues",
-    "icon_path": "assets/starter-template-icon.svg",
+    "icon_path": "assets/mention-read-receipts-icon.svg",
     "min_server_version": "6.2.1",
     "server": {
         "executables": {
